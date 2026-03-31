@@ -525,6 +525,13 @@ async function autoAssignSet(setNumber) {
     return;
   }
 
+  // 해당 세트에 결과가 저장된 경기가 하나라도 있으면 자동배정 불가
+  const hasResult = setMatches.some(m => m.status === 'completed');
+  if (hasResult) {
+    showToast(`SET ${setNumber}에 저장된 경기 결과가 있어 자동배정을 실행할 수 없습니다`, 'error');
+    return;
+  }
+
   // ── 게임 횟수 집계 (이 세트 이전까지) ──
   const gameCountMap = {};
   state.assignments.forEach(asgn => {
@@ -598,6 +605,14 @@ async function autoAssignAllSets() {
     showToast('대진표가 없습니다. 먼저 대진표를 생성하세요', 'error');
     return;
   }
+
+  // 어느 세트든 결과가 저장된 경기가 하나라도 있으면 올세트 자동배정 불가
+  const hasAnyResult = state.matches.some(m => m.status === 'completed');
+  if (hasAnyResult) {
+    showToast('저장된 경기 결과가 있어 올세트 자동배정을 실행할 수 없습니다', 'error');
+    return;
+  }
+
   showToast('올세트 자동배정 중...');
   for (let s = 1; s <= 5; s++) {
     await autoAssignSet(s);
@@ -1054,6 +1069,13 @@ function renderMatch() {
 }
 
 function _matchContent() {
+  const currentSetHasResult = state.matches
+    .filter(m => m.set_number === state.currentSet)
+    .some(m => m.status === 'completed');
+  const anySetHasResult = state.matches.some(m => m.status === 'completed');
+  const singleDisabled = currentSetHasResult ? 'disabled title="이 세트에 저장된 경기 결과가 있어 자동배정 불가"' : '';
+  const allDisabled    = anySetHasResult     ? 'disabled title="저장된 경기 결과가 있어 올세트 자동배정 불가"'  : '';
+
   return `
     <div class="assign-bar">
       <div class="assign-icon">⚡</div>
@@ -1069,8 +1091,8 @@ function _matchContent() {
                title="승리 기준 점수 설정">
         <span class="win-score-unit">점</span>
       </div>
-      <button class="btn-assign" onclick="autoAssignSet(${state.currentSet})">▶ 단세트 자동배정</button>
-      <button class="btn-assign btn-assign-all" onclick="autoAssignAllSets()">⚡ 올세트 자동배정</button>
+      <button class="btn-assign" onclick="autoAssignSet(${state.currentSet})" ${singleDisabled}>▶ 단세트 자동배정</button>
+      <button class="btn-assign btn-assign-all" onclick="autoAssignAllSets()" ${allDisabled}>⚡ 올세트 자동배정</button>
     </div>
 
     <div class="bracket-nav">
