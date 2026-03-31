@@ -1163,10 +1163,12 @@ function _teamSide(match, team, asgn) {
 
   return `
     <div class="match-team">
-      <div class="match-team-name ${!otherDone ? 'win-dblclick' : ''}"
-           ${!otherDone ? `ondblclick="fillWinScore('${match.id}', '${isA ? 'a' : 'b'}')" title="더블클릭: 승리점수 자동 입력"` : ''}>
-        ${team.name}
-        <span style="font-size:10px; color:var(--text-muted)">#${team.position}</span>
+      <div class="match-team-header">
+        <div class="match-team-name">
+          ${team.name}
+          <span style="font-size:10px; color:var(--text-muted)">#${team.position}</span>
+        </div>
+        ${!otherDone ? `<button class="btn-win" onclick="fillWinScore('${match.id}', '${isA ? 'a' : 'b'}')" title="승리점수 자동 입력">승</button>` : ''}
       </div>
       <div class="match-players">
         ${p1
