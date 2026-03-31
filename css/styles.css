@@ -252,6 +252,12 @@ body {
   transition: opacity 0.15s;
 }
 .btn-assign:hover { opacity: 0.85; }
+.btn-assign-disabled {
+  opacity: 0.4;
+  cursor: not-allowed;
+  filter: grayscale(60%);
+}
+.btn-assign-disabled:hover { opacity: 0.4; }
 .btn-assign-all {
   background: linear-gradient(135deg, var(--accent), #a855f7);
 }

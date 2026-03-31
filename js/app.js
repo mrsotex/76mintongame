@@ -1073,8 +1073,8 @@ function _matchContent() {
     .filter(m => m.set_number === state.currentSet)
     .some(m => m.status === 'completed');
   const anySetHasResult = state.matches.some(m => m.status === 'completed');
-  const singleDisabled = currentSetHasResult ? 'disabled title="이 세트에 저장된 경기 결과가 있어 자동배정 불가"' : '';
-  const allDisabled    = anySetHasResult     ? 'disabled title="저장된 경기 결과가 있어 올세트 자동배정 불가"'  : '';
+  const singleDisabled = currentSetHasResult ? 'class="btn-assign btn-assign-disabled"' : 'class="btn-assign"';
+  const allDisabled    = anySetHasResult     ? 'class="btn-assign btn-assign-all btn-assign-disabled"' : 'class="btn-assign btn-assign-all"';
 
   return `
     <div class="assign-bar">
@@ -1091,8 +1091,8 @@ function _matchContent() {
                title="승리 기준 점수 설정">
         <span class="win-score-unit">점</span>
       </div>
-      <button class="btn-assign" onclick="autoAssignSet(${state.currentSet})" ${singleDisabled}>▶ 단세트 자동배정</button>
-      <button class="btn-assign btn-assign-all" onclick="autoAssignAllSets()" ${allDisabled}>⚡ 올세트 자동배정</button>
+      <button ${singleDisabled} onclick="autoAssignSet(${state.currentSet})">▶ 단세트 자동배정</button>
+      <button ${allDisabled} onclick="autoAssignAllSets()">⚡ 올세트 자동배정</button>
     </div>
 
     <div class="bracket-nav">
