@@ -29,6 +29,10 @@ let state = {
   players:     [],   // DB players
   matches:     [],   // DB matches (대진표)
   assignments: [],   // DB game_assignments
+  destiny:     [],   // DB destiny_matches (운명의 짝궁 매칭)
+  destinyError: null,
+  destinyFinal: null, // 최종경기 결과 행 (is_final)
+  destinyWait:  {},  // court -> 'partner' | 'few' | 'done'
   currentView: 'match',
   currentSet:  1,
   winScore:    25,
@@ -41,11 +45,13 @@ let state = {
    데이터 로딩
    ───────────────────────────────────────────────────── */
 async function loadAll() {
-  const [t, p, m, a] = await Promise.all([
+  const [t, p, m, a, d, cfg] = await Promise.all([
     sb.from('teams').select('*').order('position', { nullsFirst: false }),
     sb.from('players').select('*').order('created_at'),
     sb.from('matches').select('*').order('set_number').order('court'),
     sb.from('game_assignments').select('*'),
+    sb.from('destiny_matches').select('*').order('seq'),
+    sb.from('app_settings').select('*'),
   ]);
   if (t.error) throw t.error;
   if (p.error) throw p.error;
@@ -54,6 +60,13 @@ async function loadAll() {
   state.players     = p.data || [];
   state.matches     = m.data || [];
   state.assignments = a.data || [];
+  // 마스터 설정(승리 점수): DB → 이 기기 저장값 → 기본 25
+  state.winScore = _loadWinScore(cfg.error ? [] : (cfg.data || []));
+  // 짝궁 매칭 테이블이 없어도 앱 전체는 동작해야 함
+  const dAll         = d.error ? [] : (d.data || []);
+  state.destiny      = dAll.filter(g => !g.is_final);
+  state.destinyFinal = dAll.find(g => g.is_final) || null;
+  state.destinyError = d.error ? d.error.message : null;
 }
 
 /* ─────────────────────────────────────────────────────
@@ -124,6 +137,9 @@ function renderView(view) {
     case 'match':   renderMatch();   break;
     case 'bracket': renderBracket(); break;
     case 'ranking': renderRanking(); break;
+    case 'dmatch':   renderDestinyMatch();   break;
+    case 'dbracket': renderDestinyBracket(); break;
+    case 'dranking': renderDestinyRanking(); break;
   }
 }
 
@@ -406,6 +422,19 @@ async function removeFromTeam(event, playerId) {
   await loadAll();
   renderTeams();
   showToast(`${p.name} 미배정으로 이동`);
+}
+
+/** 미배정 칩 클릭: Option(Alt)+클릭이면 명단에서 삭제, 아니면 수정 */
+async function onUnassignedChipClick(event, playerId) {
+  if (!event.altKey) { openEditPlayer(playerId); return; }
+  event.preventDefault();
+  event.stopPropagation();
+  const p = getPlayerById(playerId);
+  const { error } = await sb.from('players').delete().eq('id', playerId);
+  if (error) { showToast('삭제 실패: ' + error.message, 'error'); return; }
+  await loadAll();
+  renderTeams();
+  showToast(`${p.name} 명단에서 삭제`);
 }
 
 /** 드래그: 미배정 영역으로 드롭 */
@@ -944,11 +973,13 @@ function renderTeams() {
       <span style="font-weight:700; font-size:15px;">팀 · 선수 관리</span>
       <span style="font-size:12px; color:var(--text-muted)">${state.teams.length}팀 · ${state.players.filter(p => p.is_active).length}명</span>
       <div class="spacer"></div>
+      <button class="btn-outline" style="margin-right:6px" onclick="openSettings()">⚙️ 마스터 설정</button>
       <button class="btn-outline" style="margin-right:6px" onclick="openImportModal()">📋 마스터 명단</button>
       <button class="btn-outline btn-danger-outline" style="margin-right:6px" onclick="deleteAllGuests()">게스트 전체 삭제</button>
       <button class="btn-outline btn-danger-outline" style="margin-right:6px" onclick="resetTeamSettings()">팀 세팅 초기화</button>
       <button class="btn-outline" style="margin-right:6px" onclick="openAddTeam()">+ 팀 추가</button>
       <button class="btn-outline" style="margin-right:6px" onclick="randomAssignPlayers()">🎲 랜덤배정</button>
+      <button class="btn-outline" style="margin-right:6px" onclick="navigate('dmatch')">💘 운명의 짝궁 매칭</button>
       <button class="btn-primary" onclick="openAddPlayer()">+ 선수 등록</button>
     </div>
 
@@ -973,8 +1004,8 @@ function renderTeams() {
                draggable="true"
                ondragstart="onDragStart(event, '${p.id}')"
                ondragend="onDragEnd(event)"
-               onclick="openEditPlayer('${p.id}')"
-               title="팀 카드로 드래그해서 배정">
+               onclick="onUnassignedChipClick(event, '${p.id}')"
+               title="클릭: 수정 | Option+클릭: 명단에서 삭제 | 드래그: 팀 배정">
             <span class="gender-badge ${p.gender === 'male' ? 'male' : 'female'}" style="font-size:10px">
               ${p.gender === 'male' ? 'M' : 'F'}
             </span>
@@ -1085,10 +1116,7 @@ function _matchContent() {
       </div>
       <div class="win-score-box">
         <span class="win-score-label">승리점수</span>
-        <input class="win-score-input" id="win-score-input" type="number" min="1" max="99"
-               value="${state.winScore}"
-               onchange="setWinScore(this.value)"
-               title="승리 기준 점수 설정">
+        <b style="font-size:15px" title="팀 / 선수 관리 → 마스터 설정에서 변경">${state.winScore}</b>
         <span class="win-score-unit">점</span>
       </div>
       <button ${singleDisabled} onclick="autoAssignSet(${state.currentSet})">▶ 단세트 자동배정</button>
@@ -1239,12 +1267,6 @@ function _flowBar() {
 function switchSet(s) {
   state.currentSet = s;
   renderMatch();
-}
-
-function setWinScore(val) {
-  const v = parseInt(val, 10);
-  if (!v || v < 1) return;
-  state.winScore = v;
 }
 
 function fillWinScore(matchId, side) {
@@ -1520,6 +1542,729 @@ async function onDrop(event, teamId) {
   await loadAll();
   renderTeams();
   showToast('팀 배정 완료');
+}
+
+/* ─────────────────────────────────────────────────────
+   운명의 짝궁 매칭 (전체 선수 · 코트 3 · 복식 · 1인 5게임)
+   팀/대진표와 무관. 코트가 비면 게임 수가 적은 대기자부터 다음 게임을 짠다.
+   총 게임 = ceil(인원×5/4). 인원이 4의 배수가 아니면 일부 선수가 6게임을 하며,
+   6게임 선수의 총점은 점수가 높은 5게임만 합산한다.
+   결과는 destiny_matches 테이블에 게임별 저장 (db_destiny.sql)
+   ───────────────────────────────────────────────────── */
+const DESTINY_COURTS = ['A', 'B', 'C'];
+const DESTINY_TARGET = 5;
+let _destinyBusy = false;
+
+const _destinyTotalGames = n => Math.ceil(n * DESTINY_TARGET / 4);
+const _dIds = g => [g.t1_p1, g.t1_p2, g.t2_p1, g.t2_p2].filter(Boolean);   // 빈 자리(null) 제외
+const _dKey = (a, b) => [a, b].sort().join(':');
+
+const _shuffle = arr => {
+  const a = [...arr];
+  for (let i = a.length - 1; i > 0; i--) {
+    const j = Math.floor(Math.random() * (i + 1));
+    [a[i], a[j]] = [a[j], a[i]];
+  }
+  return a;
+};
+
+/**
+ * 코트가 비었을 때 다음 게임 1개를 정한다 (순수 함수). 사전 편성 없이 지금 쉬는 선수들로만 짠다.
+ *  - 반환: 게임 {t1_p1,t1_p2,t2_p1,t2_p2} 또는 대기 {wait: 'done'|'few'|'partner'}
+ *  - 파트너 중복 금지. 게임 수가 적은 선수 우선, 동률이면 오래 쉰 선수 우선, 상대 중복은 약하게 회피
+ *  - 후보 게임마다 "이 게임 이후에도 나머지 선수들이 파트너 중복 없이 5게임을 채울 수 있는지"를 검사해 막다른 길을 피한다
+ *  - 가능한 후보가 없으면 다른 경기 종료까지 대기. 진행 중인 게임이 없는데도 불가능한 경우(교착)에만
+ *    중복 최소 조합을 허용하고 relaxed: true 를 붙인다.
+ */
+function _destinyNext(players, rows) {
+  const G = _destinyTotalGames(players.length);
+  if (rows.length >= G) return { wait: 'done' };
+
+  const playing = new Set();
+  const count = {}, lastEnd = {}, partner = {}, versus = {};
+  players.forEach(p => { count[p.id] = 0; lastEnd[p.id] = 0; });
+  rows.forEach(g => {
+    _dIds(g).forEach(id => {
+      count[id] = (count[id] || 0) + 1;
+      if (g.status === 'playing') playing.add(id);
+      else if (g.finished_at) lastEnd[id] = Math.max(lastEnd[id] || 0, Date.parse(g.finished_at));
+    });
+    if (g.t1_p1 && g.t1_p2) { const k = _dKey(g.t1_p1, g.t1_p2); partner[k] = (partner[k] || 0) + 1; }
+    if (g.t2_p1 && g.t2_p2) { const k = _dKey(g.t2_p1, g.t2_p2); partner[k] = (partner[k] || 0) + 1; }
+    [g.t1_p1, g.t1_p2].forEach(a => [g.t2_p1, g.t2_p2].forEach(b => {
+      if (a && b) versus[_dKey(a, b)] = (versus[_dKey(a, b)] || 0) + 1;
+    }));
+  });
+
+  // 게임 수 적은 순 → 오래 쉰 순 → 무작위
+  const byPriority = (a, b) =>
+    (count[a.id] - count[b.id]) || (lastEnd[a.id] - lastEnd[b.id]) || (Math.random() - 0.5);
+  const avail = players.filter(p => !playing.has(p.id));
+  if (avail.length < 4) return { wait: 'few' };
+
+  const eligible = avail.filter(p => count[p.id] < DESTINY_TARGET).sort(byPriority);
+  const others   = avail.filter(p => count[p.id] >= DESTINY_TARGET).sort(byPriority);
+
+  // 5게임 미만 선수가 4명 안 되면 게임 수 가장 적은 선수로 채움(6번째 게임). 여유분 한도 내에서만.
+  const need      = Math.max(0, 4 - eligible.length);
+  const extraUsed = players.reduce((s, p) => s + Math.max(0, count[p.id] - DESTINY_TARGET), 0);
+  const spare     = 4 * G - DESTINY_TARGET * players.length;
+  if (need > 0 && extraUsed + need > spare && playing.size > 0) return { wait: 'few' };
+
+  const combos = (arr, k) => {
+    const out = [];
+    (function pick(start, cur) {
+      if (cur.length === k) { out.push([...cur]); return; }
+      for (let i = start; i < arr.length; i++) { cur.push(arr[i]); pick(i + 1, cur); cur.pop(); }
+    })(0, []);
+    return out;
+  };
+
+  // 후보 4인 조합 × 팀 나누기. 우선순위(앞이 강함, 사전식 비교):
+  //  1) 게임 수 적은/오래 쉰 선수 우선  2) 파트너 중복(금지)  3) 2남2녀면 남녀 혼합 팀  4) 상대 중복 최소  5) 무작위
+  // relax=false면 파트너 중복 조합은 제외
+  const candidates = (sets, relax) => {
+    const out = [];
+    for (const sub of sets) {
+      const cnt  = sub.reduce((s, p) => s + count[p.id], 0);
+      const rank = sub.reduce((s, p) => s + avail.indexOf(p), 0);
+      const twoTwo = sub.filter(p => p.gender === 'male').length === 2
+                  && sub.filter(p => p.gender === 'female').length === 2;
+      for (const [i, j, x, y] of [[0, 1, 2, 3], [0, 2, 1, 3], [0, 3, 1, 2]]) {
+        const [a, b, c, d] = [sub[i], sub[j], sub[x], sub[y]];
+        const rep = (partner[_dKey(a.id, b.id)] || 0) + (partner[_dKey(c.id, d.id)] || 0);
+        if (!relax && rep > 0) continue;
+        const mixed = a.gender !== b.gender && c.gender !== d.gender;
+        const vers  = [[a, c], [a, d], [b, c], [b, d]].reduce((s, [p, q]) => s + (versus[_dKey(p.id, q.id)] || 0), 0);
+        out.push({ t: [a, b, c, d], key: [cnt * 100 + rank, rep, twoTwo && !mixed ? 1 : 0, vers, Math.random()] });
+      }
+    }
+    return out.sort((p, q) => {
+      for (let k = 0; k < p.key.length; k++) if (p.key[k] !== q.key[k]) return p.key[k] - q.key[k];
+      return 0;
+    });
+  };
+
+  // 이 게임을 하고 난 뒤에도 남은 슬롯을 파트너 중복 없이 채울 수 있는가 (무작위 구성 시도)
+  const feasibleAfter = (t) => {
+    const ids  = t.map(p => p.id);
+    const slots = 4 * (G - rows.length - 1);
+    const cnt2 = { ...count };
+    ids.forEach(id => { cnt2[id]++; });
+    const needOf = {};
+    let needTotal = 0;
+    players.forEach(p => { needOf[p.id] = Math.max(0, DESTINY_TARGET - cnt2[p.id]); needTotal += needOf[p.id]; });
+    const slack = slots - needTotal;
+    if (slack < 0) return false;
+    if (slots === 0) return true;
+    const forbidden = new Set(Object.keys(partner));
+    forbidden.add(_dKey(ids[0], ids[1])); forbidden.add(_dKey(ids[2], ids[3]));
+    const extraPool = players.filter(p => cnt2[p.id] <= DESTINY_TARGET).map(p => p.id);
+    if (slack > extraPool.length) return false;
+
+    for (let attempt = 0; attempt < 25; attempt++) {
+      const rem = { ...needOf };
+      _shuffle(extraPool).slice(0, slack).forEach(id => { rem[id]++; });
+      const used = new Set(forbidden);
+      let ok = true;
+      for (;;) {
+        const live = players.map(p => p.id).filter(id => rem[id] > 0);
+        if (!live.length) break;
+        const maxR = Math.max(...live.map(id => rem[id]));
+        const v = _shuffle(live.filter(id => rem[id] === maxR))[0];
+        const cands = _shuffle(live.filter(id => id !== v && !used.has(_dKey(v, id))))
+          .sort((a, b) => rem[b] - rem[a]);
+        if (cands.length < rem[v]) { ok = false; break; }
+        cands.slice(0, rem[v]).forEach(u => { used.add(_dKey(v, u)); rem[u]--; });
+        rem[v] = 0;
+      }
+      if (ok) return true;
+    }
+    return false;
+  };
+
+  const toGame = (c, relaxed) => ({
+    t1_p1: c.t[0].id, t1_p2: c.t[1].id, t2_p1: c.t[2].id, t2_p2: c.t[3].id,
+    ...(relaxed ? { relaxed: true } : {}),
+  });
+  const setsFor = K => need === 0
+    ? combos(eligible.slice(0, K), 4)
+    : combos(others, need).map(f => [...eligible, ...f]);
+
+  const stages = need === 0 && eligible.length > 10 ? [10, eligible.length] : [10];
+  for (const K of stages) {
+    for (const c of candidates(setsFor(K), false).slice(0, 80)) {
+      if (feasibleAfter(c.t)) return toGame(c, false);
+    }
+  }
+  if (playing.size > 0) return { wait: 'partner' };     // 다른 경기가 끝나면 다시 시도
+
+  // 교착: 진행 중인 게임이 없는데도 불가능 → 중복 최소 조합 허용
+  const fallback = candidates(need === 0 ? combos(eligible, 4) : setsFor(10), true);
+  return fallback.length ? toGame(fallback[0], true) : { wait: 'few' };
+}
+
+/** 선수별 합산: 자기 팀 점수의 합. 6게임 이상이면 높은 5게임만 */
+function _destinyStandings(players, rows) {
+  const scores = {};
+  players.forEach(p => { scores[p.id] = []; });
+  rows.filter(g => g.status === 'done').forEach(g => {
+    [[g.t1_p1, g.t1_p2, g.t1_score], [g.t2_p1, g.t2_p2, g.t2_score]].forEach(([a, b, sc]) => {
+      [a, b].forEach(id => { (scores[id] ||= []).push(sc ?? 0); });
+    });
+  });
+  return players.map(p => {
+    const all  = [...scores[p.id]].sort((a, b) => b - a);
+    const used = all.slice(0, DESTINY_TARGET);
+    return { player: p, games: all.length, total: used.reduce((s, v) => s + v, 0), dropped: all.length > DESTINY_TARGET ? all[DESTINY_TARGET] : null };
+  }).sort((a, b) => (b.total - a.total) || (a.games - b.games) || a.player.name.localeCompare(b.player.name, 'ko'));
+}
+
+async function _destinyFill() {
+  const players = state.players.filter(p => p.is_active);
+  state.destinyWait = {};
+  for (const court of DESTINY_COURTS) {
+    if (state.destiny.some(g => g.status === 'playing' && g.court === court)) continue;
+    const next = _destinyNext(players, state.destiny);
+    if (next.wait) { state.destinyWait[court] = next.wait; continue; }
+    const { relaxed, ...game } = next;
+    const seq = Math.max(0, ...state.destiny.map(g => g.seq ?? 0)) + 1;
+    const { data, error } = await sb.from('destiny_matches')
+      .insert({ ...game, seq, court, status: 'playing' }).select().single();
+    if (error) { showToast('게임 저장 실패: ' + error.message, 'error'); return; }
+    state.destiny.push(data);
+    if (relaxed) showToast('⚠️ 파트너 중복을 피할 수 없어 예외 배정했습니다', 'error');
+  }
+}
+
+const _dName = id => id ? (getPlayerById(id)?.name ?? '(삭제된 선수)') : '(빈 자리)';
+const _dPlayers = () => state.players.filter(p => p.is_active);
+
+/** 점수 입력 초안: key -> { winner: 1|2, loser: string }. 화면이 다시 그려져도 입력이 유지된다 */
+const _destinyDraft = {};
+
+/** 승리 버튼 + 점수칸. 승리 팀은 승리 점수가 자동 입력(수정 불가), 진 팀만 점수를 입력한다 */
+function _dScoreCtl(key, side) {
+  const d = _destinyDraft[key] || {};
+  const isWin = d.winner === side, isLose = d.winner && !isWin;
+  const input = isWin
+    ? `value="${state.winScore}" readonly`
+    : isLose ? `value="${d.loser ?? ''}" oninput="_destinyDraft['${key}'].loser = this.value" placeholder="점수"`
+             : 'disabled placeholder="-"';
+  return `<button class="btn-win ${isWin ? 'active' : ''}" onclick="setDestinyWinner('${key}', ${side})">승리</button>
+    <input id="d-s${side}-${key}" type="number" min="0" max="${state.winScore - 1}" class="win-score-input"
+           style="width:52px; ${isWin ? 'color:var(--win); font-weight:900' : ''}" ${input}>`;
+}
+
+function setDestinyWinner(key, side) {
+  const d = _destinyDraft[key];
+  if (d && d.winner === side) return;
+  _destinyDraft[key] = { winner: side, loser: '' };
+  renderDestinyMatch();
+  document.getElementById(`d-s${side === 1 ? 2 : 1}-${key}`)?.focus();
+}
+
+/** 초안 → [t1점수, t2점수]. 잘못되면 토스트 후 null */
+function _destinyReadScores(key) {
+  const d = _destinyDraft[key];
+  if (!d || !d.winner) { showToast('승리한 팀의 [승리] 버튼을 누르세요', 'error'); return null; }
+  const lose = parseInt(d.loser, 10);
+  if (Number.isNaN(lose) || lose < 0 || lose >= state.winScore) {
+    showToast(`진 팀 점수를 0~${state.winScore - 1} 사이로 입력하세요`, 'error'); return null;
+  }
+  return d.winner === 1 ? [state.winScore, lose] : [lose, state.winScore];
+}
+
+/** 선수 표시: 성별 · 이름 · 급수 · 게임 수 (현재 진행 중인 게임 포함) */
+function _dPlayerTag(id) {
+  const p = getPlayerById(id);
+  if (!p) return '<span>(삭제된 선수)</span>';
+  const n = state.destiny.filter(g => _dIds(g).includes(id)).length;
+  return `<span style="display:inline-flex; align-items:center; gap:4px; white-space:nowrap">
+    <span class="gender-badge ${p.gender === 'male' ? 'male' : 'female'}" style="font-size:10px">${p.gender === 'male' ? 'M' : 'F'}</span>
+    <span>${p.name}</span>
+    ${p.level ? `<span class="level-badge">${p.level}</span>` : ''}
+    <span class="games-count" style="margin-left:2px">${n}게임</span></span>`;
+}
+
+/* ── 드래그앤드롭: 대기 ↔ 게임 멤버 교체, 게임 멤버 ↔ 게임 멤버 교체, 멤버를 대기로 빼기 ── */
+let _destinyDrag = null;   // { src: 'wait', id } | { src: 'game', gameId, key }
+const _DKEYS = ['t1_p1', 't1_p2', 't2_p1', 't2_p2'];
+
+/** 게임 슬롯 한 칸(선수 또는 빈 자리). 선수는 드래그할 수 있고, 모든 칸이 드롭 대상 */
+function _dSlot(g, key) {
+  const id = g[key];
+  const drag = id ? `draggable="true" ondragstart="destinyDragStart(event, 'game', '${g.id}', '${key}')" ondragend="destinyDragEnd(event)"` : '';
+  return `<span class="d-slot ${id ? '' : 'empty'}" ${drag}
+      ondragover="destinyDragOver(event)" ondragleave="this.classList.remove('over')" ondrop="destinyDrop(event, '${g.id}', '${key}')">${
+    id ? _dPlayerTag(id) : '빈 자리 · 대기 선수를 끌어다 놓기'}</span>`;
+}
+
+function destinyDragStart(event, src, a, b) {
+  _destinyDrag = src === 'wait' ? { src, id: a } : { src, gameId: a, key: b };
+  event.dataTransfer.effectAllowed = 'move';
+  event.dataTransfer.setData('text/plain', 'destiny');
+  event.currentTarget.style.opacity = '0.5';
+}
+function destinyDragEnd(event) {
+  event.currentTarget.style.opacity = '';
+  _destinyDrag = null;
+  document.querySelectorAll('.d-slot.over, .drag-over').forEach(el => el.classList.remove('over', 'drag-over'));
+}
+function destinyDragOver(event) {
+  if (!_destinyDrag) return;
+  event.preventDefault();
+  event.currentTarget.classList.add(event.currentTarget.classList.contains('d-slot') ? 'over' : 'drag-over');
+}
+
+/** 이동 후 상태가 룰을 지키는지 검사. 위반 사유 문자열 또는 null. newGames: 변경된 게임들(전체 필드) */
+function _destinyMoveViolation(newGames) {
+  const players = _dPlayers();
+  const G       = _destinyTotalGames(players.length);
+  const spare   = 4 * G - DESTINY_TARGET * players.length;
+  const touched = new Set(newGames.map(g => g.id));
+  const others  = state.destiny.filter(g => !touched.has(g.id));
+
+  // 1) 파트너 중복 금지: 이미 다른 게임에서 같이 한 조합이면 불가
+  const seen = new Set();
+  others.forEach(g => {
+    if (g.t1_p1 && g.t1_p2) seen.add(_dKey(g.t1_p1, g.t1_p2));
+    if (g.t2_p1 && g.t2_p2) seen.add(_dKey(g.t2_p1, g.t2_p2));
+  });
+  for (const g of newGames) {
+    for (const [a, b] of [[g.t1_p1, g.t1_p2], [g.t2_p1, g.t2_p2]]) {
+      if (!a || !b) continue;
+      const k = _dKey(a, b);
+      if (seen.has(k)) return `${_dName(a)} · ${_dName(b)} 은(는) 이미 파트너로 경기했습니다 (파트너 중복 금지)`;
+      seen.add(k);
+    }
+  }
+
+  // 2) 게임 수 한도: 인당 최대 6게임, 6게임은 전체 여유분 안에서만
+  const count = {};
+  [...others, ...newGames].forEach(g => _dIds(g).forEach(id => { count[id] = (count[id] || 0) + 1; }));
+  for (const [id, n] of Object.entries(count)) {
+    if (n > DESTINY_TARGET + 1) return `${_dName(id)} 선수는 최대 ${DESTINY_TARGET + 1}게임을 넘길 수 없습니다`;
+  }
+  const extra = Object.values(count).reduce((s, n) => s + Math.max(0, n - DESTINY_TARGET), 0);
+  if (extra > spare) return `${DESTINY_TARGET + 1}게임을 하는 선수는 전체 ${spare}명까지만 가능합니다 (게임 수 한도 초과)`;
+
+  // 3) 한 선수가 같은 게임에 두 번 들어갈 수 없음
+  for (const g of newGames) {
+    const ids = _dIds(g);
+    if (new Set(ids).size !== ids.length) return '같은 선수가 한 게임에 두 번 들어갈 수 없습니다';
+  }
+  return null;
+}
+
+async function _destinyCommitMove(newGames) {
+  if (_destinyBusy) return;
+  const why = _destinyMoveViolation(newGames);
+  if (why) { showToast('⚠️ ' + why + ' — 이동을 취소했습니다', 'error'); renderDestinyMatch(); return; }
+
+  _destinyBusy = true;
+  try {
+    const results = await Promise.all(newGames.map(ng =>
+      sb.from('destiny_matches')
+        .update(Object.fromEntries(_DKEYS.map(k => [k, ng[k]])))
+        .eq('id', ng.id).eq('status', 'playing')));
+    const failed = results.find(r => r.error);
+    if (failed) {
+      showToast('이동 저장 실패: ' + failed.error.message + ' (db_destiny.sql을 다시 실행했나요?)', 'error');
+      return;
+    }
+    newGames.forEach(ng => Object.assign(state.destiny.find(g => g.id === ng.id), Object.fromEntries(_DKEYS.map(k => [k, ng[k]]))));
+    showToast('선수 변경 완료');
+  } finally {
+    _destinyBusy = false;
+    renderDestinyMatch();
+  }
+}
+
+/** 게임 슬롯에 드롭: 대기 선수 → 교체 / 다른 슬롯의 선수 → 맞교환(빈 자리면 이동) */
+async function destinyDrop(event, gameId, key) {
+  event.preventDefault();
+  event.currentTarget.classList.remove('over');
+  const d = _destinyDrag; _destinyDrag = null;
+  if (!d) return;
+  const g2 = state.destiny.find(g => g.id === gameId);
+  if (!g2 || g2.status !== 'playing') return;
+
+  if (d.src === 'wait') {
+    const ng = { ...g2, [key]: d.id };
+    return _destinyCommitMove([ng]);
+  }
+  const g1 = state.destiny.find(g => g.id === d.gameId);
+  if (!g1 || g1.status !== 'playing') return;
+  if (g1.id === g2.id && d.key === key) return;
+  if (g1.id === g2.id) {
+    const ng = { ...g1 };
+    [ng[d.key], ng[key]] = [g1[key], g1[d.key]];
+    return _destinyCommitMove([ng]);
+  }
+  const ng1 = { ...g1 }, ng2 = { ...g2 };
+  ng1[d.key] = g2[key];
+  ng2[key]   = g1[d.key];
+  return _destinyCommitMove([ng1, ng2]);
+}
+
+/** 대기 영역에 드롭: 게임 멤버를 대기로 뺀다 (빈 자리가 생긴다) */
+async function destinyDropWait(event) {
+  event.preventDefault();
+  event.currentTarget.classList.remove('drag-over');
+  const d = _destinyDrag; _destinyDrag = null;
+  if (!d || d.src !== 'game') return;
+  const g = state.destiny.find(x => x.id === d.gameId);
+  if (!g || g.status !== 'playing') return;
+  return _destinyCommitMove([{ ...g, [d.key]: null }]);
+}
+
+function _destinyErrorHtml() {
+  return `<div class="empty-state"><div class="empty-icon">⚠️</div>
+    <p style="color:var(--lose)">짝궁 매칭 테이블을 불러오지 못했습니다</p>
+    <p style="margin-top:8px; font-size:12px">${state.destinyError}</p>
+    <p style="margin-top:8px; font-size:12px; color:var(--text-muted)">db_destiny.sql을 Supabase SQL Editor에서 실행했는지 확인하세요.</p></div>`;
+}
+
+/** 경기 운영 · 짝궁 경기: 코트별 진행 + 점수 입력 */
+function renderDestinyMatch() {
+  const el = document.getElementById('view-dmatch');
+  if (state.destinyError) { el.innerHTML = _destinyErrorHtml(); return; }
+
+  const players  = _dPlayers();
+  const rows     = state.destiny;
+  const G        = _destinyTotalGames(players.length);
+  const done     = rows.filter(g => g.status === 'done').length;
+  const finished = done >= G;
+  const playing  = new Set(rows.filter(g => g.status === 'playing').flatMap(_dIds));
+  const cnt      = id => rows.filter(g => _dIds(g).includes(id)).length;
+
+  const courts = DESTINY_COURTS.map(c => {
+    const g = rows.find(x => x.status === 'playing' && x.court === c);
+    if (!g) return `<div class="destiny-court"><b>코트 ${c}</b>
+      <div style="color:var(--text-muted); font-size:12px; margin-top:10px">${
+        finished ? '모든 게임 종료'
+        : !rows.length ? '시작 전'
+        : state.destinyWait[c] === 'partner'
+          ? '⏳ 다른 경기 종료까지 대기<br><span style="font-size:11px">파트너가 겹치지 않게 배정할 수 있는 조합이 아직 없습니다</span>'
+          : state.destinyWait[c] === 'few'
+            ? '⏳ 다른 경기 종료까지 대기<br><span style="font-size:11px">배정 가능한 대기 인원이 부족합니다</span>'
+            : '비어 있음 · 상단의 [게임 배정]을 누르면 배정됩니다'
+      }</div></div>`;
+    return `
+      <div class="destiny-court playing">
+        <div style="display:flex; justify-content:space-between"><b>코트 ${c}</b><span style="font-size:11px; color:var(--text-muted)">GAME ${g.seq}/${G}</span></div>
+        <div style="display:flex; align-items:center; gap:8px; margin-top:12px; font-size:14px">
+          <span style="flex:1; font-weight:600; display:flex; flex-direction:column; gap:3px">${_dSlot(g, 't1_p1')}${_dSlot(g, 't1_p2')}</span>
+          ${_dScoreCtl(g.id, 1)}
+        </div>
+        <div style="text-align:center; font-size:11px; color:var(--text-muted); margin:4px 0">VS</div>
+        <div style="display:flex; align-items:center; gap:8px; font-size:14px">
+          <span style="flex:1; font-weight:600; display:flex; flex-direction:column; gap:3px">${_dSlot(g, 't2_p1')}${_dSlot(g, 't2_p2')}</span>
+          ${_dScoreCtl(g.id, 2)}
+        </div>
+        <button class="btn-primary" style="width:100%; margin-top:12px" onclick="finishDestiny('${g.id}')">게임 종료</button>
+      </div>`;
+  }).join('');
+
+  const waiting = players.filter(p => !playing.has(p.id))
+    .sort((a, b) => cnt(a.id) - cnt(b.id))
+    .map(p => `<span class="player-chip" draggable="true" style="cursor:grab"
+        ondragstart="destinyDragStart(event, 'wait', '${p.id}')" ondragend="destinyDragEnd(event)">${_dPlayerTag(p.id)}</span>`).join('');
+  const emptyCourts = DESTINY_COURTS.filter(c => !rows.some(g => g.status === 'playing' && g.court === c)).length;
+  const canAssign   = rows.length > 0 && !finished && emptyCourts > 0 && rows.length < G;
+
+  el.innerHTML = `
+    <div class="control-bar">
+      <span style="font-weight:700; font-size:15px;">💘 짝궁 경기</span>
+      <span style="font-size:12px; color:var(--text-muted)">${players.length}명 · 인당 ${DESTINY_TARGET}게임 · 총 ${G}게임 · ${done}/${G} 종료${finished ? ' 🎉' : ''}</span>
+      <div class="spacer"></div>
+      ${rows.length ? `<button class="btn-primary" style="margin-right:6px" ${canAssign ? '' : 'disabled'} onclick="assignDestiny()"
+        title="빈 코트에 대기 선수로 다음 게임을 배정합니다">🎯 게임 배정${canAssign ? ` (빈 코트 ${emptyCourts})` : ''}</button>` : ''}
+      <button class="btn-outline" onclick="startDestiny()">${rows.length ? '🎲 새로 시작' : '🎲 시작'}</button>
+    </div>
+    <div class="warn-banner" style="margin-bottom:12px">
+      게임이 끝나면 [게임 종료]로 코트를 비우고, 다른 코트도 끝낸 뒤 [게임 배정]을 누르면 쉬고 있는 선수 중 게임 수가 적은 사람부터 빈 코트에 배정됩니다. 같은 파트너는 두 번 만나지 않으며, 배정할 수 없으면 다른 경기가 끝날 때까지 대기합니다. 6게임을 한 선수는 점수가 높은 5게임만 합산합니다.
+      <a onclick="navigate('dbracket')">짝궁 대진표</a> · <a onclick="navigate('dranking')">짝궁 순위</a>
+    </div>
+    <div class="court-grid">${courts}</div>
+    <div class="unassigned-section" style="margin-top:16px"
+         ondragover="destinyDragOver(event)" ondragleave="this.classList.remove('drag-over')" ondrop="destinyDropWait(event)">
+      <div class="unassigned-title">대기 선수 (${players.length - playing.size}명 · 게임 수 적은 순) — 게임 멤버를 여기로 끌어다 놓으면 대기로 뺍니다</div>
+      <div class="player-chips">${waiting || '<span style="font-size:12px; color:var(--text-muted)">없음</span>'}</div>
+    </div>
+    ${rows.length ? _destinyFinalHtml(finished) : ''}`;
+}
+
+/** 최종경기 팀: 최고득점 1위+최저득점 1위, 최고득점 2위+최저득점 2위. 동점은 게임 수 적은 순 → 이름순 */
+function _destinyFinalTeams() {
+  const all  = _destinyStandings(_dPlayers(), state.destiny);
+  // 합산 점수가 0점인 선수는 최종경기 매칭 금지 → 제외하고 남은 선수로 순위를 매긴다
+  const rank = all.filter(r => r.total > 0).map((r, i) => ({ ...r, rank: i + 1 }));
+  const excluded = all.filter(r => r.total <= 0).map(r => r.player.name);
+  if (rank.length < 4) return { teams: null, excluded };
+  const n = rank.length;
+  return {
+    teams: { t1: [rank[0], rank[n - 1]], t2: [rank[1], rank[n - 2]] },
+    excluded,
+  };
+}
+
+function _destinyFinalHtml(finished) {
+  const f = state.destinyFinal;
+  const pl = r => `<div style="font-weight:700; font-size:15px">${r.player.name}</div>
+    <div style="font-size:11px; color:var(--text-muted)">${r.rank}위 · ${r.total}점</div>`;
+
+  let t1, t2, excludedNote = '';
+  if (f) {                                   // 저장된 결과: 당시 구성 그대로
+    const rank = _destinyStandings(_dPlayers(), state.destiny);
+    const info = id => ({ player: { name: _dName(id) }, rank: rank.findIndex(r => r.player.id === id) + 1,
+                          total: rank.find(r => r.player.id === id)?.total ?? '-' });
+    t1 = [info(f.t1_p1), info(f.t1_p2)]; t2 = [info(f.t2_p1), info(f.t2_p2)];
+  } else {
+    const ft = _destinyFinalTeams();
+    excludedNote = ft.excluded.length
+      ? `<div style="font-size:12px; color:var(--lose); margin-bottom:8px">0점 선수는 최종경기에 매칭할 수 없어 제외했습니다: ${ft.excluded.join(', ')}</div>` : '';
+    if (!ft.teams) {
+      return `
+    <div class="unassigned-section" style="margin-top:16px">
+      <div class="unassigned-title">🏁 최종경기</div>
+      ${excludedNote}
+      <div style="font-size:12px; color:var(--text-muted)">점수가 있는 선수가 4명 이상 있어야 최종경기를 구성할 수 있습니다.</div>
+    </div>`;
+    }
+    t1 = ft.teams.t1; t2 = ft.teams.t2;
+  }
+
+  const side = (arr, label, scoreHtml) => `
+    <div style="flex:1; padding:12px; border:1px solid var(--border); border-radius:8px; background:var(--surface2)">
+      <div style="font-size:11px; color:var(--text-muted); margin-bottom:6px">${label}</div>
+      <div style="display:flex; gap:16px">${arr.map(pl).map(h => `<div>${h}</div>`).join('')}</div>
+      <div style="margin-top:10px">${scoreHtml}</div>
+    </div>`;
+
+  let s1 = '', s2 = '', foot = '';
+  if (f) {
+    s1 = `<span style="font-size:22px; font-weight:900">${f.t1_score}</span>`;
+    s2 = `<span style="font-size:22px; font-weight:900">${f.t2_score}</span>`;
+    const win = f.t1_score === f.t2_score ? '무승부' : f.t1_score > f.t2_score ? '1팀 승리 🏆' : '2팀 승리 🏆';
+    foot = `<div style="margin-top:10px; display:flex; align-items:center; gap:10px">
+      <b style="color:var(--accent)">${win}</b>
+      <button class="btn-outline" onclick="resetDestinyFinal()">결과 다시 입력</button></div>`;
+  } else if (finished) {
+    s1 = _dScoreCtl('final', 1); s2 = _dScoreCtl('final', 2);
+    foot = `<button class="btn-primary" style="margin-top:10px" onclick="saveDestinyFinal()">최종경기 결과 저장</button>`;
+  }
+
+  return `
+    <div class="unassigned-section" style="margin-top:16px">
+      <div class="unassigned-title">🏁 최종경기${f ? ' · 종료' : finished ? '' : ' · 예상 (짝궁 경기가 모두 끝나면 확정)'}</div>
+      ${excludedNote}
+      <div style="font-size:12px; color:var(--text-muted); margin-bottom:10px">
+        최고득점 1위 + 최저득점 1위 / 최고득점 2위 + 최저득점 2위가 한 팀 (득점 = 합산 점수)
+      </div>
+      <div style="display:flex; align-items:stretch; gap:12px">
+        ${side(t1, '1팀 (최고 1위 + 최저 1위)', s1)}
+        <div style="align-self:center; font-size:12px; color:var(--text-muted)">VS</div>
+        ${side(t2, '2팀 (최고 2위 + 최저 2위)', s2)}
+      </div>
+      ${foot}
+    </div>`;
+}
+
+async function saveDestinyFinal() {
+  if (_destinyBusy) return;
+  const t = _destinyFinalTeams().teams;
+  if (!t) { showToast('0점 선수는 매칭할 수 없어 최종경기를 구성할 수 없습니다', 'error'); return; }
+  const sc = _destinyReadScores('final');
+  if (!sc) return;
+  const [s1, s2] = sc;
+  _destinyBusy = true;
+  try {
+    const row = {
+      is_final: true, status: 'done', t1_score: s1, t2_score: s2, finished_at: new Date().toISOString(),
+      t1_p1: t.t1[0].player.id, t1_p2: t.t1[1].player.id, t2_p1: t.t2[0].player.id, t2_p2: t.t2[1].player.id,
+    };
+    const { data, error } = await sb.from('destiny_matches').insert(row).select().single();
+    if (error) { showToast('저장 실패: ' + error.message + ' (db_destiny.sql을 다시 실행했나요?)', 'error'); return; }
+    state.destinyFinal = data;
+    delete _destinyDraft.final;
+    showToast('🏁 최종경기 결과 저장');
+    renderDestinyMatch();
+  } finally { _destinyBusy = false; }
+}
+
+function resetDestinyFinal() {
+  openConfirm('최종경기 결과를 지우고 다시 입력할까요?', async () => {
+    const { error } = await sb.from('destiny_matches').delete().eq('id', state.destinyFinal.id);
+    if (error) { showToast('삭제 실패: ' + error.message, 'error'); return; }
+    state.destinyFinal = null;
+    delete _destinyDraft.final;
+    renderDestinyMatch();
+  });
+}
+
+/** 경기 운영 · 짝궁 대진표: 지금까지 편성된 게임 전체 */
+function renderDestinyBracket() {
+  const el = document.getElementById('view-dbracket');
+  if (state.destinyError) { el.innerHTML = _destinyErrorHtml(); return; }
+
+  const rows  = [...state.destiny].sort((a, b) => (a.seq ?? 1e9) - (b.seq ?? 1e9));
+  const done  = rows.filter(g => g.status === 'done').length;
+  const G     = _destinyTotalGames(_dPlayers().length);
+
+  el.innerHTML = `
+    <div class="control-bar">
+      <span style="font-weight:700; font-size:15px;">짝궁 대진표</span>
+      <span style="font-size:12px; color:var(--text-muted)">편성 ${rows.length}/${G}게임 · 종료 ${done}</span>
+    </div>
+    ${rows.length ? `
+    <div style="overflow-x:auto">
+      <table class="bracket-table">
+        <thead><tr><th>게임</th><th>코트</th><th>팀 1</th><th>점수</th><th>팀 2</th><th>상태</th></tr></thead>
+        <tbody>
+          ${rows.map(g => `
+            <tr>
+              <td>${g.seq ? '#' + g.seq : '-'}</td>
+              <td>${g.court || '-'}</td>
+              <td>${_dName(g.t1_p1)} · ${_dName(g.t1_p2)}</td>
+              <td>${g.status === 'done' ? `<b>${g.t1_score} : ${g.t2_score}</b>` : '-'}</td>
+              <td>${_dName(g.t2_p1)} · ${_dName(g.t2_p2)}</td>
+              <td><span class="status-badge ${g.status === 'done' ? 'status-done' : g.status === 'playing' ? 'status-active' : 'status-pending'}">${g.status === 'done' ? '완료' : g.status === 'playing' ? '진행 중' : '대기'}</span></td>
+            </tr>`).join('')}
+        </tbody>
+      </table>
+    </div>
+    <div style="margin-top:10px; font-size:12px; color:var(--text-muted)">남은 게임은 코트가 비는 대로 자동 편성됩니다.</div>
+    ` : `<div class="empty-state"><div class="empty-icon">📋</div><p>편성된 게임이 없습니다.</p>
+      <button class="btn-primary" style="margin-top:16px" onclick="navigate('dmatch')">짝궁 경기로 이동</button></div>`}`;
+}
+
+/** 경기 운영 · 짝궁 순위 */
+function renderDestinyRanking() {
+  const el = document.getElementById('view-dranking');
+  if (state.destinyError) { el.innerHTML = _destinyErrorHtml(); return; }
+
+  const players   = _dPlayers();
+  const G         = _destinyTotalGames(players.length);
+  const done      = state.destiny.filter(g => g.status === 'done').length;
+  const pct       = G > 0 ? Math.round(done / G * 100) : 0;
+  const rankClass = ['rank-1', 'rank-2', 'rank-3'];
+  const rank      = _destinyStandings(players, state.destiny);
+
+  el.innerHTML = `
+    <div style="margin-bottom:12px; font-size:12px; color:var(--text-muted)">
+      선수 점수 = 자기 팀이 낸 점수의 합 &nbsp;|&nbsp; 6게임을 한 선수는 가장 낮은 점수 1게임 제외 &nbsp;|&nbsp; 종료된 게임 기준
+    </div>
+    <table class="rank-table">
+      <thead><tr><th>순위</th><th>선수</th><th>게임</th><th>합산 점수</th><th>제외 점수</th></tr></thead>
+      <tbody>
+        ${rank.map((r, i) => `
+          <tr>
+            <td><span class="rank-num ${rankClass[i] || ''}">${i + 1}</span></td>
+            <td style="font-weight:700">${r.player.name}</td>
+            <td>${r.games}</td>
+            <td><span class="score-stat">${r.total}</span></td>
+            <td style="color:var(--text-muted)">${r.dropped !== null ? r.dropped : '-'}</td>
+          </tr>`).join('')}
+      </tbody>
+    </table>
+    <div style="margin-top:16px; padding:14px; background:var(--surface2); border-radius:8px; border:1px solid var(--border)">
+      <div style="display:flex; justify-content:space-between; font-size:12px; margin-bottom:6px">
+        <span style="color:var(--text-muted)">경기 진행률</span>
+        <span style="color:var(--accent); font-weight:700">${done} / ${G}게임 종료</span>
+      </div>
+      <div class="progress-bar"><div class="progress-fill" style="width:${pct}%"></div></div>
+    </div>`;
+}
+
+function startDestiny() {
+  const players = _dPlayers();
+  if (players.length < 4) { showToast('활성 선수가 4명 이상 필요합니다', 'error'); return; }
+  const run = async () => {
+    const { error } = await sb.from('destiny_matches').delete().not('id', 'is', null);
+    if (error) { showToast('초기화 실패: ' + error.message, 'error'); return; }
+    state.destiny = [];
+    state.destinyFinal = null;
+    Object.keys(_destinyDraft).forEach(k => delete _destinyDraft[k]);
+    await _destinyFill();
+    renderView(state.currentView);
+    showToast(`💘 시작! 총 ${_destinyTotalGames(players.length)}게임`);
+  };
+  if (!state.destiny.length && !state.destinyFinal) { run(); return; }
+  openConfirm('진행 중인 짝궁 매칭 기록을 모두 지우고 새로 시작할까요?\n되돌릴 수 없습니다.', run);
+}
+
+async function finishDestiny(gameId) {
+  if (_destinyBusy) return;
+  const g = state.destiny.find(x => x.id === gameId);
+  if (!g) return;
+  if (_dIds(g).length < 4) { showToast('⚠️ 빈 자리가 있어 종료할 수 없습니다. 대기 선수를 채워 주세요', 'error'); return; }
+  const sc = _destinyReadScores(gameId);
+  if (!sc) return;
+  const [s1, s2] = sc;
+  _destinyBusy = true;
+  try {
+    const patch = { status: 'done', t1_score: s1, t2_score: s2, finished_at: new Date().toISOString() };
+    const { error } = await sb.from('destiny_matches').update(patch).eq('id', gameId).eq('status', 'playing');
+    if (error) { showToast('저장 실패: ' + error.message, 'error'); return; }
+    Object.assign(g, patch);
+    delete _destinyDraft[gameId];
+    state.destinyWait = {};
+    renderDestinyMatch();
+    showToast('게임 종료 · 코트가 비었습니다. 모든 코트가 끝나면 [게임 배정]을 누르세요');
+  } finally {
+    _destinyBusy = false;
+  }
+}
+
+/** 빈 코트에 대기 선수로 다음 게임 배정 (관리자가 직접 실행) */
+async function assignDestiny() {
+  if (_destinyBusy) return;
+  _destinyBusy = true;
+  try {
+    const before = state.destiny.length;
+    await _destinyFill();
+    renderDestinyMatch();
+    const n = state.destiny.length - before;
+    if (n > 0) showToast(`${n}개 코트에 게임을 배정했습니다`);
+    else showToast('지금은 배정할 수 있는 조합이 없습니다. 다른 경기가 끝나면 다시 눌러주세요', 'error');
+  } finally {
+    _destinyBusy = false;
+  }
+}
+
+/* ─────────────────────────────────────────────────────
+   마스터 설정 (승리 점수 21 / 25) — app_settings 테이블, 없으면 이 기기(localStorage)에 저장
+   ───────────────────────────────────────────────────── */
+const WIN_SCORE_OPTIONS = [21, 25];
+const WIN_SCORE_LS_KEY  = 'minsachin76_win_score';
+
+function _loadWinScore(rows) {
+  const row = rows.find(r => r.key === 'win_score');
+  let v = row ? parseInt(row.value, 10) : NaN;
+  if (!WIN_SCORE_OPTIONS.includes(v)) {
+    try { v = parseInt(localStorage.getItem(WIN_SCORE_LS_KEY), 10); } catch { v = NaN; }
+  }
+  return WIN_SCORE_OPTIONS.includes(v) ? v : 25;
+}
+
+function openSettings() {
+  showModal('modal-settings');
+  document.querySelectorAll('input[name="win-score-opt"]').forEach(r => { r.checked = Number(r.value) === state.winScore; });
+}
+
+async function saveSettings() {
+  const sel = document.querySelector('input[name="win-score-opt"]:checked');
+  const v = sel ? Number(sel.value) : NaN;
+  if (!WIN_SCORE_OPTIONS.includes(v)) { showToast('승리 점수를 선택하세요', 'error'); return; }
+  state.winScore = v;
+  try { localStorage.setItem(WIN_SCORE_LS_KEY, String(v)); } catch { /* 저장 불가 환경 */ }
+  const { error } = await sb.from('app_settings').upsert({ key: 'win_score', value: String(v) });
+  closeAllModals();
+  renderView(state.currentView);
+  if (error) showToast(`승리 점수 ${v}점 · 설정 테이블이 없어 이 기기에만 저장됨 (db_destiny.sql 실행 필요)`, 'error');
+  else showToast(`승리 점수 ${v}점으로 설정했습니다`);
 }
 
 /* ─────────────────────────────────────────────────────
