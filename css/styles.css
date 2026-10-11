@@ -1066,3 +1066,7 @@ body {
 .d-slot:hover { background: rgba(255,255,255,0.05); }
 .d-slot.over { border-color: var(--accent); background: rgba(0,212,255,0.12); }
 .d-slot.empty { cursor: default; color: var(--text-muted); font-size: 12px; font-weight: 400; border-color: rgba(255,255,255,0.18); }
+
+/* HOLD(부상) 선수 */
+.hold-badge { font-size: 9px; font-weight: 700; padding: 1px 5px; border-radius: 3px; background: rgba(239,68,68,0.18); color: var(--lose); }
+.player-chip.hold { opacity: 0.6; border-style: dashed; }

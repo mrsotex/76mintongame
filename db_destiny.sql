@@ -49,3 +49,6 @@ ALTER TABLE app_settings ENABLE ROW LEVEL SECURITY;
 DROP POLICY IF EXISTS "allow_all" ON app_settings;
 CREATE POLICY "allow_all" ON app_settings FOR ALL TO anon USING (true) WITH CHECK (true);
 INSERT INTO app_settings (key, value) VALUES ('win_score', '25') ON CONFLICT (key) DO NOTHING;
+
+-- HOLD(부상) 선수: 게임에 배정되지 않음
+ALTER TABLE players ADD COLUMN IF NOT EXISTS is_hold BOOLEAN NOT NULL DEFAULT false;

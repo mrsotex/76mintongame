@@ -58,6 +58,7 @@ async function loadAll() {
 
   state.teams       = t.data || [];
   state.players     = p.data || [];
+  _applyLocalHold();
   state.matches     = m.data || [];
   state.assignments = a.data || [];
   // 마스터 설정(승리 점수): DB → 이 기기 저장값 → 기본 25
@@ -1555,7 +1556,19 @@ const DESTINY_COURTS = ['A', 'B', 'C'];
 const DESTINY_TARGET = 5;
 let _destinyBusy = false;
 
-const _destinyTotalGames = n => Math.ceil(n * DESTINY_TARGET / 4);
+/**
+ * 총 게임 수 = 지금까지 편성된 게임 + 앞으로 필요한 게임.
+ * 앞으로 필요한 게임은 (HOLD가 아닌 선수들이 5게임을 채우는 데 부족한 자리 수) / 4 올림.
+ * 시작 전에는 ceil(인원 × 5 / 4)와 같다.
+ */
+function _destinyGames(players, rows) {
+  const count = {};
+  rows.forEach(g => _dIds(g).forEach(id => { count[id] = (count[id] || 0) + 1; }));
+  const need = players.reduce((s, p) => s + Math.max(0, DESTINY_TARGET - (count[p.id] || 0)), 0);
+  return rows.length + Math.ceil(need / 4);
+}
+const _dActive = () => state.players.filter(p => p.is_active && !p.is_hold);   // 배정 대상 (HOLD 제외)
+const _destinyGamesNow = () => _destinyGames(_dActive(), state.destiny);
 const _dIds = g => [g.t1_p1, g.t1_p2, g.t2_p1, g.t2_p2].filter(Boolean);   // 빈 자리(null) 제외
 const _dKey = (a, b) => [a, b].sort().join(':');
 
@@ -1577,7 +1590,7 @@ const _shuffle = arr => {
  *    중복 최소 조합을 허용하고 relaxed: true 를 붙인다.
  */
 function _destinyNext(players, rows) {
-  const G = _destinyTotalGames(players.length);
+  const G = _destinyGames(players, rows);
   if (rows.length >= G) return { wait: 'done' };
 
   const playing = new Set();
@@ -1607,9 +1620,9 @@ function _destinyNext(players, rows) {
 
   // 5게임 미만 선수가 4명 안 되면 게임 수 가장 적은 선수로 채움(6번째 게임). 여유분 한도 내에서만.
   const need      = Math.max(0, 4 - eligible.length);
-  const extraUsed = players.reduce((s, p) => s + Math.max(0, count[p.id] - DESTINY_TARGET), 0);
-  const spare     = 4 * G - DESTINY_TARGET * players.length;
-  if (need > 0 && extraUsed + need > spare && playing.size > 0) return { wait: 'few' };
+  const needTotal = players.reduce((s, p) => s + Math.max(0, DESTINY_TARGET - count[p.id]), 0);
+  const slackNow  = 4 * (G - rows.length) - needTotal;      // 앞으로 6번째 게임이 생길 수 있는 자리 수
+  if (need > 0 && need > slackNow && playing.size > 0) return { wait: 'few' };
 
   const combos = (arr, k) => {
     const out = [];
@@ -1721,7 +1734,7 @@ function _destinyStandings(players, rows) {
 }
 
 async function _destinyFill() {
-  const players = state.players.filter(p => p.is_active);
+  const players = _dActive();
   state.destinyWait = {};
   for (const court of DESTINY_COURTS) {
     if (state.destiny.some(g => g.status === 'playing' && g.court === court)) continue;
@@ -1784,7 +1797,8 @@ function _dPlayerTag(id) {
     <span class="gender-badge ${p.gender === 'male' ? 'male' : 'female'}" style="font-size:10px">${p.gender === 'male' ? 'M' : 'F'}</span>
     <span>${p.name}</span>
     ${p.level ? `<span class="level-badge">${p.level}</span>` : ''}
-    <span class="games-count" style="margin-left:2px">${n}게임</span></span>`;
+    <span class="games-count" style="margin-left:2px">${n}게임</span>
+    ${p.is_hold ? '<span class="hold-badge">HOLD</span>' : ''}</span>`;
 }
 
 /* ── 드래그앤드롭: 대기 ↔ 게임 멤버 교체, 게임 멤버 ↔ 게임 멤버 교체, 멤버를 대기로 빼기 ── */
@@ -1795,7 +1809,8 @@ const _DKEYS = ['t1_p1', 't1_p2', 't2_p1', 't2_p2'];
 function _dSlot(g, key) {
   const id = g[key];
   const drag = id ? `draggable="true" ondragstart="destinyDragStart(event, 'game', '${g.id}', '${key}')" ondragend="destinyDragEnd(event)"` : '';
-  return `<span class="d-slot ${id ? '' : 'empty'}" ${drag}
+  const ctx = id ? `oncontextmenu="toggleHold(event, '${id}')" title="우클릭: HOLD(부상) 토글"` : '';
+  return `<span class="d-slot ${id ? '' : 'empty'}" ${drag} ${ctx}
       ondragover="destinyDragOver(event)" ondragleave="this.classList.remove('over')" ondrop="destinyDrop(event, '${g.id}', '${key}')">${
     id ? _dPlayerTag(id) : '빈 자리 · 대기 선수를 끌어다 놓기'}</span>`;
 }
@@ -1819,10 +1834,21 @@ function destinyDragOver(event) {
 
 /** 이동 후 상태가 룰을 지키는지 검사. 위반 사유 문자열 또는 null. newGames: 변경된 게임들(전체 필드) */
 function _destinyMoveViolation(newGames) {
-  const players = _dPlayers();
-  const G       = _destinyTotalGames(players.length);
-  const spare   = 4 * G - DESTINY_TARGET * players.length;
+  const players = _dActive();
+  const G       = _destinyGames(players, state.destiny);
+  const heldSlots = state.destiny.reduce((n, g) => n + _dIds(g).filter(id => getPlayerById(id)?.is_hold).length, 0);
+  const spare   = 4 * G - heldSlots - DESTINY_TARGET * players.length;
   const touched = new Set(newGames.map(g => g.id));
+
+  // 0) HOLD(부상) 선수는 게임에 들어갈 수 없음
+  for (const ng of newGames) {
+    const orig = state.destiny.find(g => g.id === ng.id);
+    for (const k of _DKEYS) {
+      if (ng[k] && ng[k] !== orig[k] && getPlayerById(ng[k])?.is_hold) {
+        return `${_dName(ng[k])} 선수는 HOLD 상태라 게임에 들어갈 수 없습니다`;
+      }
+    }
+  }
   const others  = state.destiny.filter(g => !touched.has(g.id));
 
   // 1) 파트너 중복 금지: 이미 다른 게임에서 같이 한 조합이면 불가
@@ -1846,7 +1872,7 @@ function _destinyMoveViolation(newGames) {
   for (const [id, n] of Object.entries(count)) {
     if (n > DESTINY_TARGET + 1) return `${_dName(id)} 선수는 최대 ${DESTINY_TARGET + 1}게임을 넘길 수 없습니다`;
   }
-  const extra = Object.values(count).reduce((s, n) => s + Math.max(0, n - DESTINY_TARGET), 0);
+  const extra = Object.entries(count).reduce((s, [id, n]) => s + (getPlayerById(id)?.is_hold ? 0 : Math.max(0, n - DESTINY_TARGET)), 0);
   if (extra > spare) return `${DESTINY_TARGET + 1}게임을 하는 선수는 전체 ${spare}명까지만 가능합니다 (게임 수 한도 초과)`;
 
   // 3) 한 선수가 같은 게임에 두 번 들어갈 수 없음
@@ -1919,6 +1945,46 @@ async function destinyDropWait(event) {
   return _destinyCommitMove([{ ...g, [d.key]: null }]);
 }
 
+/* ── HOLD(부상): 우클릭으로 토글. HOLD 선수는 앞으로 게임에 배정되지 않고 총 게임 수 계산에서도 빠진다 ──
+   players.is_hold 컬럼(db_destiny.sql)에 저장하고, 컬럼이 아직 없으면 이 기기(localStorage)에 임시 저장한다 */
+const HOLD_LS_KEY = 'minsachin76_hold_ids';
+function _localHoldIds() {
+  try { return new Set(JSON.parse(localStorage.getItem(HOLD_LS_KEY) || '[]')); } catch { return new Set(); }
+}
+function _saveLocalHoldIds(set) {
+  try { localStorage.setItem(HOLD_LS_KEY, JSON.stringify([...set])); } catch { /* 저장 불가 환경 */ }
+}
+/** DB에 is_hold 컬럼이 없을 때만 localStorage 값을 적용 */
+function _applyLocalHold() {
+  if (!state.players.length || 'is_hold' in state.players[0]) return;
+  const ids = _localHoldIds();
+  state.players.forEach(p => { p.is_hold = ids.has(p.id); });
+}
+
+async function toggleHold(event, playerId) {
+  event.preventDefault();
+  event.stopPropagation();
+  const p = getPlayerById(playerId);
+  if (!p) return;
+  const next = !p.is_hold;
+  const { error } = await sb.from('players').update({ is_hold: next }).eq('id', playerId);
+  let local = false;
+  if (error) {                     // 컬럼이 아직 없음 → 이 기기에만 저장
+    const ids = _localHoldIds();
+    if (next) ids.add(playerId); else ids.delete(playerId);
+    _saveLocalHoldIds(ids);
+    local = true;
+  }
+  p.is_hold = next;
+  renderView(state.currentView);
+  const playingNow = state.destiny.some(g => g.status === 'playing' && _dIds(g).includes(playerId));
+  showToast(
+    `${p.name} ${next ? 'HOLD 설정 · 앞으로 게임에 배정되지 않습니다' : 'HOLD 해제'}`
+    + (next && playingNow ? ' (진행 중인 게임은 그대로)' : '')
+    + (local ? ' · SQL 실행 전이라 이 기기에만 저장됨' : ''),
+    local ? 'error' : 'success');
+}
+
 function _destinyErrorHtml() {
   return `<div class="empty-state"><div class="empty-icon">⚠️</div>
     <p style="color:var(--lose)">짝궁 매칭 테이블을 불러오지 못했습니다</p>
@@ -1933,7 +1999,7 @@ function renderDestinyMatch() {
 
   const players  = _dPlayers();
   const rows     = state.destiny;
-  const G        = _destinyTotalGames(players.length);
+  const G        = _destinyGames(_dActive(), rows);
   const done     = rows.filter(g => g.status === 'done').length;
   const finished = done >= G;
   const playing  = new Set(rows.filter(g => g.status === 'playing').flatMap(_dIds));
@@ -1949,7 +2015,9 @@ function renderDestinyMatch() {
           ? '⏳ 다른 경기 종료까지 대기<br><span style="font-size:11px">파트너가 겹치지 않게 배정할 수 있는 조합이 아직 없습니다</span>'
           : state.destinyWait[c] === 'few'
             ? '⏳ 다른 경기 종료까지 대기<br><span style="font-size:11px">배정 가능한 대기 인원이 부족합니다</span>'
-            : '비어 있음 · 상단의 [게임 배정]을 누르면 배정됩니다'
+            : state.destinyWait[c] === 'done'
+              ? '남은 게임 없음 · 진행 중인 게임이 끝나면 종료됩니다'
+              : '비어 있음 · 상단의 [게임 배정]을 누르면 배정됩니다'
       }</div></div>`;
     return `
       <div class="destiny-court playing">
@@ -1967,10 +2035,15 @@ function renderDestinyMatch() {
       </div>`;
   }).join('');
 
-  const waiting = players.filter(p => !playing.has(p.id))
-    .sort((a, b) => cnt(a.id) - cnt(b.id))
-    .map(p => `<span class="player-chip" draggable="true" style="cursor:grab"
-        ondragstart="destinyDragStart(event, 'wait', '${p.id}')" ondragend="destinyDragEnd(event)">${_dPlayerTag(p.id)}</span>`).join('');
+  const waitPlayers = players.filter(p => !playing.has(p.id) && !p.is_hold).sort((a, b) => cnt(a.id) - cnt(b.id));
+  const waiting = waitPlayers
+    .map(p => `<span class="player-chip" draggable="true" style="cursor:grab" title="우클릭: HOLD(부상) 설정"
+        ondragstart="destinyDragStart(event, 'wait', '${p.id}')" ondragend="destinyDragEnd(event)"
+        oncontextmenu="toggleHold(event, '${p.id}')">${_dPlayerTag(p.id)}</span>`).join('');
+  const holdPlayers = players.filter(p => p.is_hold && !playing.has(p.id));
+  const holdChips = holdPlayers
+    .map(p => `<span class="player-chip hold" style="cursor:context-menu" title="우클릭: HOLD 해제"
+        oncontextmenu="toggleHold(event, '${p.id}')">${_dPlayerTag(p.id)}</span>`).join('');
   const emptyCourts = DESTINY_COURTS.filter(c => !rows.some(g => g.status === 'playing' && g.court === c)).length;
   const canAssign   = rows.length > 0 && !finished && emptyCourts > 0 && rows.length < G;
 
@@ -1990,15 +2063,17 @@ function renderDestinyMatch() {
     <div class="court-grid">${courts}</div>
     <div class="unassigned-section" style="margin-top:16px"
          ondragover="destinyDragOver(event)" ondragleave="this.classList.remove('drag-over')" ondrop="destinyDropWait(event)">
-      <div class="unassigned-title">대기 선수 (${players.length - playing.size}명 · 게임 수 적은 순) — 게임 멤버를 여기로 끌어다 놓으면 대기로 뺍니다</div>
+      <div class="unassigned-title">대기 선수 (${waitPlayers.length}명 · 게임 수 적은 순) — 게임 멤버를 여기로 끌어다 놓으면 대기로 뺍니다 · 선수 우클릭: HOLD(부상) 토글</div>
       <div class="player-chips">${waiting || '<span style="font-size:12px; color:var(--text-muted)">없음</span>'}</div>
+      ${holdChips ? `<div class="unassigned-title" style="margin-top:12px">🩹 HOLD (${holdPlayers.length}명) — 게임에 배정되지 않습니다 · 우클릭으로 해제</div>
+      <div class="player-chips">${holdChips}</div>` : ''}
     </div>
     ${rows.length ? _destinyFinalHtml(finished) : ''}`;
 }
 
 /** 최종경기 팀: 최고득점 1위+최저득점 1위, 최고득점 2위+최저득점 2위. 동점은 게임 수 적은 순 → 이름순 */
 function _destinyFinalTeams() {
-  const all  = _destinyStandings(_dPlayers(), state.destiny);
+  const all  = _destinyStandings(_dActive(), state.destiny);   // HOLD(부상) 선수는 최종경기 제외
   // 합산 점수가 0점인 선수는 최종경기 매칭 금지 → 제외하고 남은 선수로 순위를 매긴다
   const rank = all.filter(r => r.total > 0).map((r, i) => ({ ...r, rank: i + 1 }));
   const excluded = all.filter(r => r.total <= 0).map(r => r.player.name);
@@ -2111,7 +2186,7 @@ function renderDestinyBracket() {
 
   const rows  = [...state.destiny].sort((a, b) => (a.seq ?? 1e9) - (b.seq ?? 1e9));
   const done  = rows.filter(g => g.status === 'done').length;
-  const G     = _destinyTotalGames(_dPlayers().length);
+  const G     = _destinyGamesNow();
 
   el.innerHTML = `
     <div class="control-bar">
@@ -2146,11 +2221,12 @@ function renderDestinyRanking() {
   if (state.destinyError) { el.innerHTML = _destinyErrorHtml(); return; }
 
   const players   = _dPlayers();
-  const G         = _destinyTotalGames(players.length);
+  const G         = _destinyGamesNow();
   const done      = state.destiny.filter(g => g.status === 'done').length;
   const pct       = G > 0 ? Math.round(done / G * 100) : 0;
   const rankClass = ['rank-1', 'rank-2', 'rank-3'];
-  const rank      = _destinyStandings(players, state.destiny);
+  const rank      = _destinyStandings(players.filter(p => !p.is_hold), state.destiny);
+  const heldRank  = _destinyStandings(players.filter(p => p.is_hold), state.destiny);   // HOLD(부상) 선수는 순위에서 제외하고 따로 표시
 
   el.innerHTML = `
     <div style="margin-bottom:12px; font-size:12px; color:var(--text-muted)">
@@ -2169,6 +2245,21 @@ function renderDestinyRanking() {
           </tr>`).join('')}
       </tbody>
     </table>
+    ${heldRank.length ? `
+    <div class="unassigned-title" style="margin-top:20px">🩹 HOLD (부상) — 순위 제외 · ${heldRank.length}명</div>
+    <table class="rank-table" style="opacity:0.65">
+      <thead><tr><th>순위</th><th>선수</th><th>게임</th><th>합산 점수</th><th>제외 점수</th></tr></thead>
+      <tbody>
+        ${heldRank.map(r => `
+          <tr>
+            <td style="color:var(--text-muted)">-</td>
+            <td style="font-weight:700">${r.player.name} <span class="hold-badge">HOLD</span></td>
+            <td>${r.games}</td>
+            <td><span class="score-stat">${r.total}</span></td>
+            <td style="color:var(--text-muted)">${r.dropped !== null ? r.dropped : '-'}</td>
+          </tr>`).join('')}
+      </tbody>
+    </table>` : ''}
     <div style="margin-top:16px; padding:14px; background:var(--surface2); border-radius:8px; border:1px solid var(--border)">
       <div style="display:flex; justify-content:space-between; font-size:12px; margin-bottom:6px">
         <span style="color:var(--text-muted)">경기 진행률</span>
@@ -2179,8 +2270,8 @@ function renderDestinyRanking() {
 }
 
 function startDestiny() {
-  const players = _dPlayers();
-  if (players.length < 4) { showToast('활성 선수가 4명 이상 필요합니다', 'error'); return; }
+  const players = _dActive();
+  if (players.length < 4) { showToast('HOLD가 아닌 활성 선수가 4명 이상 필요합니다', 'error'); return; }
   const run = async () => {
     const { error } = await sb.from('destiny_matches').delete().not('id', 'is', null);
     if (error) { showToast('초기화 실패: ' + error.message, 'error'); return; }
@@ -2189,7 +2280,7 @@ function startDestiny() {
     Object.keys(_destinyDraft).forEach(k => delete _destinyDraft[k]);
     await _destinyFill();
     renderView(state.currentView);
-    showToast(`💘 시작! 총 ${_destinyTotalGames(players.length)}게임`);
+    showToast(`💘 시작! 총 ${_destinyGames(players, [])}게임`);
   };
   if (!state.destiny.length && !state.destinyFinal) { run(); return; }
   openConfirm('진행 중인 짝궁 매칭 기록을 모두 지우고 새로 시작할까요?\n되돌릴 수 없습니다.', run);
